@@ -10,6 +10,7 @@ import scipy.optimize
 import matplotlib.pyplot as plt
 import threading
 from analysis_utils import preprocess_odmr_data, extract_roi_trace, split_signal_reference
+from scipy.interpolate import interp1d
 
 # Helper for modular section creation
 
@@ -171,6 +172,8 @@ def create_fit_param_section(parent, protocol, fit_param_config):
                 show_equation(FIT_EQUATIONS['Ramsey_Double'], protocol)
             for i, (label, default) in enumerate(param_list):
                 label_text = GREEK_LABELS.get(label, label)
+                if label_text is None:
+                    label_text = str(label)
                 ttk.Label(param_frame, text=label_text).grid(row=i//2, column=(i%2)*2, sticky="ew", padx=2, pady=2)
                 var = tk.StringVar(value=str(default))
                 entry = ttk.Entry(param_frame, textvariable=var, width=8)
@@ -203,8 +206,9 @@ def create_fit_param_section(parent, protocol, fit_param_config):
     for i in range(max_cols):
         frame.columnconfigure(i, weight=1)
     for param in fit_param_config:
-        # Use Greek label if available
         label_text = GREEK_LABELS.get(param["label"], param["label"])
+        if label_text is None:
+            label_text = str(param["label"])
         ttk.Label(frame, text=label_text).grid(row=row, column=col*2, sticky="ew", padx=2, pady=2)
         if param.get("type") == "bool":
             var = tk.BooleanVar(value=param.get("default", False))
@@ -267,7 +271,11 @@ class NVAnalysisApp:
         }
         self.tab_results = {}  # Map tab widget to result object
         self.tab_fit_results = {}  # Map tab widget to latest fit result (dict with x, y, y_fit, params, equation)
+        self.data = None  # Ensure self.data always exists
         self.build_ui()
+        self.fit_animating = False
+        self.fit_anim_progress = 0
+        self.fit_anim_done = False
 
     def build_ui(self):
         main_container = ttk.Frame(self.root)
@@ -282,10 +290,18 @@ class NVAnalysisApp:
         data_load_box = ttk.LabelFrame(controls, text="1. Load Data")
         data_load_box.pack(pady=(0, 10))
         ttk.Button(data_load_box, text="Browse...", command=self.load_data, width=120).pack(pady=(0, 5))
-        self.loaded_label = ttk.Label(data_load_box, text="Loaded: <filename>")
-        self.loaded_label.pack(anchor="w", pady=(5, 0))
+        # Frame for Loaded: label and spinner
+        loaded_frame = ttk.Frame(data_load_box)
+        loaded_frame.pack(anchor="w", pady=(5, 0), fill=tk.X)
+        self.loaded_label = ttk.Label(loaded_frame, text="Loaded: <filename>")
+        self.loaded_label.pack(side="left")
+        self.spinner_label = ttk.Label(loaded_frame, text="", width=2)
+        self.spinner_label.pack(side="left")
         self.shape_label = ttk.Label(data_load_box, text="Shape: -")
         self.shape_label.pack(anchor="w", pady=(0, 0))
+        self._spinner_running = False
+        self._spinner_cycle = ['|', '/', '-', '\\']
+        self._spinner_index = 0
         # Protocol Selection
         proto_box = ttk.LabelFrame(controls, text="2. Select Protocol")
         proto_box.pack(pady=(0, 10))
@@ -302,10 +318,23 @@ class NVAnalysisApp:
         self.custom_range_label.pack(anchor="w", padx=5, pady=2)
         self.custom_range_entry = ttk.Entry(self.custom_range_frame)
         self.custom_range_entry.pack(fill=tk.X, padx=5, pady=2)
+        # --- Animated Analysis Progress Label ---
+        self.analysis_anim_text = "Analyzing..."
+        self.analysis_anim_progress = 0
+        self.analysis_animating = False
+        self.analysis_thread = None
+        self.analysis_done = False
+        self.analysis_anim_frame = ttk.Frame(controls)
+        self.analysis_anim_frame.pack(pady=(0, 0))
+        for c in self.analysis_anim_text:
+            lbl = ttk.Label(self.analysis_anim_frame, text=c, foreground="#bbbbbb", font=("Arial", 11, "bold"))
+            lbl.pack(side="left")
+        self.analysis_anim_frame.pack_forget()  # Hide initially
+
         # Run Analysis and Save Results Buttons (side by side)
         analysis_btn_frame = ttk.Frame(controls)
         analysis_btn_frame.pack(pady=(0, 10), fill=tk.X)
-        self.run_button = ttk.Button(analysis_btn_frame, text="5. Run Analysis", command=self.run_analysis)
+        self.run_button = ttk.Button(analysis_btn_frame, text="5. Run Analysis", command=self.start_analysis)
         self.run_button.pack(side="left", expand=True, fill=tk.X, padx=(0, 2))
         self.save_button = ttk.Button(analysis_btn_frame, text="Save Results", command=self.save_results)
         self.save_button.pack(side="left", expand=True, fill=tk.X, padx=(2, 0))
@@ -363,7 +392,7 @@ class NVAnalysisApp:
             self.fit_param_frame, self.fit_param_entries = create_fit_param_section(self.root.nametowidget(self.param_frame.master), protocol, fit_param_config)
             self.fit_param_frame.pack(fill=tk.X, pady=10)
             # Wire up Save Fit Results button
-            if "save_fit_btn" in self.fit_param_entries:
+            if self.fit_param_entries and "save_fit_btn" in self.fit_param_entries:
                 self.fit_param_entries["save_fit_btn"].config(command=self.save_fit_results)
         else:
             self.fit_param_frame = None
@@ -378,10 +407,341 @@ class NVAnalysisApp:
         self.param_frame, self.param_entries = create_param_section(self.root.nametowidget(self.param_frame.master), proto)
         # Pack the correct one just before the Run Analysis button
         if proto == "T1":
+            # Only show the custom range for T1
             self.custom_range_frame.pack(fill=tk.X, pady=10, before=self.run_button)
+            self.custom_range_frame.lift()  # Ensure it's on top/visible
         else:
             self.param_frame.pack(fill=tk.X, pady=10, before=self.run_button)
         self.create_fit_param_section(proto)
+
+    def start_analysis(self):
+        self.analysis_anim_progress = 0
+        self.analysis_animating = True
+        self.analysis_done = False
+        self.run_button.config(state="disabled", text="")
+        self.animate_analysis_button()
+        # Start the real analysis in a background thread
+        self.analysis_thread = threading.Thread(target=self._run_analysis_with_callback_safe, daemon=True)
+        self.analysis_thread.start()
+
+    def _run_analysis_with_callback_safe(self):
+        try:
+            result = self._run_analysis_computation_only()
+            self.root.after(0, lambda: self._handle_analysis_result(result))
+        finally:
+            self.root.after(0, self.finish_analysis)
+
+    def _run_analysis_computation_only(self):
+        proto = self.proto_cb.get().strip()
+        filename = self.loaded_label.cget("text").replace("Loaded: ", "")
+        tab_label = f"{proto} - {filename}" if filename and filename != "<filename>" else proto
+        result = {"proto": proto, "tab_label": tab_label, "result_obj": None, "error": None}
+        try:
+            if self.data is None:
+                result["error"] = "No data loaded."
+                return result
+            if proto == "CW":
+                # Get ROI and parameters
+                x_min = int(self.roi_entries["X start"].get())
+                x_max = int(self.roi_entries["X end"].get())
+                y_min = int(self.roi_entries["Y start"].get())
+                y_max = int(self.roi_entries["Y end"].get())
+                start = float(self.param_entries["Start"].get())
+                end = float(self.param_entries["End"].get())
+                step = float(self.param_entries["Steps"].get())
+                x_range = np.arange(start, end + step, step)
+                num_points = len(x_range)
+                num_averages = int(self.data.shape[0] // num_points)
+                if num_averages * num_points != self.data.shape[0]:
+                    raise ValueError(f"Data shape ({self.data.shape[0]}) is not a multiple of computed number of points ({num_points}).")
+                image = self.data[-1] if self.data.ndim == 3 else self.data
+                # --- Use preprocessed data if available ---
+                if hasattr(self, "preprocessed_cw_data") and self.preprocessed_cw_data is not None and self.preprocessed_cw_data.shape[0] == num_points:
+                    print("[CW] Using fast ROI extraction pipeline.")
+                    try:
+                        from analysis_utils import extract_roi_trace
+                        odmr_trace = extract_roi_trace(self.preprocessed_cw_data, x_min, x_max, y_min, y_max)
+                        from analysis_results import ODMRResult
+                        result_obj = ODMRResult(
+                            x=x_range,
+                            y=odmr_trace,
+                            y2=odmr_trace,
+                            image=self.preprocessed_cw_data[-1],
+                            x_min=x_min,
+                            x_max=x_max,
+                            y_min=y_min,
+                            y_max=y_max,
+                            filtered_y=None
+                        )
+                        result["result_obj"] = result_obj
+                        return result
+                    except Exception as e:
+                        print("CW fast ROI extraction failed, falling back:", e)
+                # --- First run: do full analysis and preprocess for future fast ROI ---
+                print("[CW] Running full analysis and preprocessing for future fast ROI extraction.")
+                from odmr_analy import odmr_analyze_data
+                result_obj = odmr_analyze_data(
+                    image=image,
+                    data=self.data,
+                    x_range=x_range,
+                    x_min=x_min,
+                    x_max=x_max,
+                    y_min=y_min,
+                    y_max=y_max,
+                    num_averages=num_averages,
+                    num_points=num_points
+                )
+                # After successful run, preprocess and store for future fast ROI
+                usable = self.data[3*num_points:]
+                num_usable_frames = usable.shape[0]
+                if num_usable_frames % num_points != 0:
+                    self.preprocessed_cw_data = None
+                    print("[CW] Preprocessing skipped: shape mismatch (usable frames not divisible by num_points).")
+                else:
+                    from analysis_utils import preprocess_odmr_data
+                    num_averages_post = num_usable_frames // num_points
+                    self.preprocessed_cw_data = preprocess_odmr_data(usable, num_averages_post, num_points)
+                    self.cw_num_points = num_points
+                    print("[CW] Preprocessing complete. Fast ROI extraction enabled for future runs.")
+                result["result_obj"] = result_obj
+            elif proto == "Rabi":
+                x_min = int(self.roi_entries["X start"].get())
+                x_max = int(self.roi_entries["X end"].get())
+                y_min = int(self.roi_entries["Y start"].get())
+                y_max = int(self.roi_entries["Y end"].get())
+                start = float(self.param_entries["Start"].get())
+                end = float(self.param_entries["End"].get())
+                num_points = int(self.param_entries["Number of Points"].get())
+                x_range = np.linspace(start, end, num_points)
+                num_averages = int(self.data.shape[0] // (2 * num_points))
+                if num_averages * 2 * num_points != self.data.shape[0]:
+                    raise ValueError(f"Data shape ({self.data.shape[0]}) is not a multiple of 2 x computed number of points ({num_points}).")
+                image = self.data[-1] if self.data.ndim == 3 else self.data
+                # --- Use preprocessed data if available ---
+                use_preprocessed = (
+                    hasattr(self, 'rabi_pixel_traces') and self.rabi_pixel_traces is not None and
+                    hasattr(self, 'rabi_num_points') and self.rabi_num_points == num_points and
+                    hasattr(self, 'rabi_x_range') and np.array_equal(self.rabi_x_range, x_range)
+                )
+                if use_preprocessed:
+                    print("[Rabi] Using preprocessed data for fast ROI extraction")
+                    try:
+                        roi_trace = self.extract_rabi_roi_trace(x_min, x_max, y_min, y_max)
+                        class FastRabiResult:
+                            def __init__(self, x, y, image, roi_bounds):
+                                self.x = x
+                                self.y = y
+                                self.error = np.zeros_like(y)
+                                self.mean_signal = y
+                                self.mean_reference = np.ones_like(y)
+                                self.image = image
+                                self.roi_bounds = roi_bounds
+                        result_obj = FastRabiResult(x_range, roi_trace, image, (x_min, x_max, y_min, y_max))
+                        result["result_obj"] = result_obj
+                        return result
+                    except Exception as e:
+                        print(f"[Rabi] Fast extraction failed, falling back to full analysis: {e}")
+                # --- First run: do full analysis and preprocess for future fast ROI ---
+                print("[Rabi] Running full analysis and preprocessing data")
+                from rabi_analy import rabi_analyze_data
+                result_obj = rabi_analyze_data(
+                    image=image,
+                    data=self.data,
+                    x_range=x_range,
+                    x_min=x_min,
+                    x_max=x_max,
+                    y_min=y_min,
+                    y_max=y_max,
+                    num_averages=num_averages,
+                    num_points=num_points
+                )
+                # Preprocess data for future fast ROI extraction
+                try:
+                    self.rabi_pixel_traces = self.preprocess_rabi_data(self.data, num_averages, num_points)
+                    self.rabi_num_points = num_points
+                    self.rabi_x_range = x_range.copy()
+                    print("[Rabi] Preprocessing complete. Fast ROI extraction enabled for future runs.")
+                except Exception as e:
+                    print(f"[Rabi] Preprocessing failed: {e}")
+                result["result_obj"] = result_obj
+            elif proto == "Ramsey":
+                x_min = int(self.roi_entries["X start"].get())
+                x_max = int(self.roi_entries["X end"].get())
+                y_min = int(self.roi_entries["Y start"].get())
+                y_max = int(self.roi_entries["Y end"].get())
+                start = float(self.param_entries["Start"].get())
+                end = float(self.param_entries["End"].get())
+                num_points = int(self.param_entries["Number of Points"].get())
+                x_range = np.linspace(start, end, num_points)
+                num_averages = int(self.data.shape[0] // (2 * num_points))
+                if num_averages * 2 * num_points != self.data.shape[0]:
+                    raise ValueError(f"Data shape ({self.data.shape[0]}) is not a multiple of 2 x computed number of points ({num_points}).")
+                image = self.data[-1] if self.data.ndim == 3 else self.data
+                # --- Use preprocessed data if available ---
+                use_preprocessed = (
+                    hasattr(self, 'ramsey_pixel_traces') and self.ramsey_pixel_traces is not None and
+                    hasattr(self, 'ramsey_num_points') and self.ramsey_num_points == num_points and
+                    hasattr(self, 'ramsey_x_range') and np.array_equal(self.ramsey_x_range, x_range)
+                )
+                if use_preprocessed:
+                    print("[Ramsey] Using preprocessed data for fast ROI extraction")
+                    try:
+                        roi_trace = self.extract_ramsey_roi_trace(x_min, x_max, y_min, y_max)
+                        class FastRamseyResult:
+                            def __init__(self, x, y, image, roi_bounds):
+                                self.x = x
+                                self.y = y
+                                self.error = np.zeros_like(y)
+                                self.mean_signal = y
+                                self.mean_reference = np.ones_like(y)
+                                self.image = image
+                                self.roi_bounds = roi_bounds
+                        result_obj = FastRamseyResult(x_range, roi_trace, image, (x_min, x_max, y_min, y_max))
+                        result["result_obj"] = result_obj
+                        return result
+                    except Exception as e:
+                        print(f"[Ramsey] Fast extraction failed, falling back to full analysis: {e}")
+                # --- First run: do full analysis and preprocess for future fast ROI ---
+                print("[Ramsey] Running full analysis and preprocessing data")
+                from rabi_analy import rabi_analyze_data
+                result_obj = rabi_analyze_data(
+                    image=image,
+                    data=self.data,
+                    x_range=x_range,
+                    x_min=x_min,
+                    x_max=x_max,
+                    y_min=y_min,
+                    y_max=y_max,
+                    num_averages=num_averages,
+                    num_points=num_points
+                )
+                # Preprocess data for future fast ROI extraction
+                try:
+                    self.ramsey_pixel_traces = self.preprocess_ramsey_data(self.data, num_averages, num_points)
+                    self.ramsey_num_points = num_points
+                    self.ramsey_x_range = x_range.copy()
+                    print("[Ramsey] Preprocessing complete. Fast ROI extraction enabled for future runs.")
+                except Exception as e:
+                    print(f"[Ramsey] Preprocessing failed: {e}")
+                result["result_obj"] = result_obj
+            elif proto == "T1":
+                # T1: Always run full analysis. No fast ROI pipeline is implemented for T1.
+                x_min = int(self.roi_entries["X start"].get())
+                x_max = int(self.roi_entries["X end"].get())
+                y_min = int(self.roi_entries["Y start"].get())
+                y_max = int(self.roi_entries["Y end"].get())
+                # Use custom x_range if provided in the custom_range_entry
+                custom_range_str = self.custom_range_entry.get().strip()
+                default_x_range = np.array([15000, 14000, 13000, 12000, 11000, 10000, 9000, 8000, 7000, 6000, 5000, 4000, 3000, 2000, 1500, 1200, 1000, 800, 500, 300, 100]) * 1e-3
+                start_str = self.param_entries["Start"].get() if self.param_entries and "Start" in self.param_entries else ""
+                end_str = self.param_entries["End"].get() if self.param_entries and "End" in self.param_entries else ""
+                step_str = self.param_entries["Steps"].get() if self.param_entries and "Steps" in self.param_entries else ""
+                x_range = None
+                if custom_range_str:
+                    try:
+                        x_range = np.array([float(val) for val in custom_range_str.split(",")]) * 1e-3
+                    except Exception:
+                        messagebox.showerror("Input Error", "Invalid custom range values. Please enter comma-separated numbers.")
+                        return
+                elif start_str.strip() == "" and end_str.strip() == "" and step_str.strip() == "":
+                    x_range = default_x_range
+                else:
+                    try:
+                        start = float(start_str) if start_str.strip() != "" else default_x_range[-1]
+                        end = float(end_str) if end_str.strip() != "" else default_x_range[0]
+                        step = float(step_str) if step_str.strip() != "" else -(abs(end-start)/max(1,len(default_x_range)-1))
+                        if step > 0:
+                            step = -step  # Ensure descending order
+                        x_range = np.arange(end, start+step, step)[::-1] if step < 0 else np.arange(start, end+step, step)
+                    except Exception:
+                        messagebox.showerror("Input Error", "Invalid experimental parameters.")
+                        return
+                num_points = len(x_range)
+                try:
+                    num_averages = int(self.data.shape[0] // num_points)
+                except Exception:
+                    result["error"] = "Data shape does not match computed number of points."
+                    return result
+                if num_averages * num_points != self.data.shape[0]:
+                    result["error"] = f"Data shape ({self.data.shape[0]}) is not a multiple of computed number of points ({num_points})."
+                    return result
+                image = self.data[-1] if self.data.ndim == 3 else self.data
+                try:
+                    from t1_analy import t1_analyze_data
+                    result_obj = t1_analyze_data(
+                        image=image,
+                        data=self.data,
+                        x_range=x_range,
+                        x_min=x_min,
+                        x_max=x_max,
+                        y_min=y_min,
+                        y_max=y_max
+                    )
+                    result["result_obj"] = result_obj
+                except Exception as e:
+                    result["error"] = f"T1 analysis failed: {e}"
+                    return result
+            else:
+                result["error"] = "Unknown protocol"
+        except Exception as e:
+            result["error"] = str(e)
+        return result
+
+    def _handle_analysis_result(self, result):
+        proto = result.get("proto")
+        tab_label = result.get("tab_label")
+        error = result.get("error")
+        if error:
+            messagebox.showerror("Analysis Error", error)
+            return
+        if proto == "CW":
+            tab = ttk.Frame(self.results_notebook)
+            self._add_tab_with_close(tab, tab_label)
+            self.results_notebook.select(tab)
+            self.tab_results[tab] = result["result_obj"]
+            self.populate_cw_result_tab(tab, result["result_obj"])
+        elif proto == "Rabi":
+            tab = ttk.Frame(self.results_notebook)
+            self._add_tab_with_close(tab, tab_label)
+            self.results_notebook.select(tab)
+            self.tab_results[tab] = result["result_obj"]
+            self.populate_rabi_result_tab(tab, result["result_obj"])
+        elif proto == "Ramsey":
+            tab = ttk.Frame(self.results_notebook)
+            self._add_tab_with_close(tab, tab_label)
+            self.results_notebook.select(tab)
+            self.tab_results[tab] = result["result_obj"]
+            self.populate_ramsey_result_tab(tab, result["result_obj"])
+        elif proto == "T1":
+            tab = ttk.Frame(self.results_notebook)
+            self._add_tab_with_close(tab, tab_label)
+            self.results_notebook.select(tab)
+            self.tab_results[tab] = result["result_obj"]
+            self.populate_t1_result_tab(tab, result["result_obj"])
+        else:
+            tab = ttk.Frame(self.results_notebook)
+            self._add_tab_with_close(tab, tab_label)
+            self.results_notebook.select(tab)
+            self.populate_result_tab(tab, proto)
+
+    def animate_analysis_button(self):
+        # Typewriter effect: show 1 more letter each time, fade color from gray to black
+        if self.analysis_done:
+            self.run_button.config(text="5. Run Analysis", state="normal")
+            return
+        display = self.analysis_anim_text[:self.analysis_anim_progress]
+        self.run_button.config(text=display)
+        if self.analysis_animating and not self.analysis_done:
+            # Loop the animation
+            self.analysis_anim_progress = (self.analysis_anim_progress + 1) % (len(self.analysis_anim_text) + 1)
+            self.root.after(80, self.animate_analysis_button)
+
+    def finish_analysis(self):
+        # Robustly stop animation and reset button label/state
+        self.analysis_animating = False
+        self.analysis_done = True
+        # Force update the button label and state
+        self.run_button.config(text="5. Run Analysis", state="normal")
 
     def run_analysis(self):
         proto = self.proto_cb.get()
@@ -572,31 +932,29 @@ class NVAnalysisApp:
             
             if not use_preprocessed:
                 print("[Rabi] Running full analysis and preprocessing data")
+            try:
+                result = rabi_analyze_data(
+                    image=image,
+                    data=self.data,
+                    x_range=x_range,
+                    x_min=x_min,
+                    x_max=x_max,
+                    y_min=y_min,
+                    y_max=y_max,
+                    num_averages=num_averages,
+                    num_points=num_points
+                )
+                # Preprocess data for future fast ROI extraction
                 try:
-                    result = rabi_analyze_data(
-                        image=image,
-                        data=self.data,
-                        x_range=x_range,
-                        x_min=x_min,
-                        x_max=x_max,
-                        y_min=y_min,
-                        y_max=y_max,
-                        num_averages=num_averages,
-                        num_points=num_points
-                    )
-                    
-                    # Preprocess data for future fast ROI extraction
-                    try:
-                        self.rabi_pixel_traces = self.preprocess_rabi_data(self.data, num_averages, num_points)
-                        self.rabi_num_points = num_points
-                        self.rabi_x_range = x_range.copy()
-                        print("[Rabi] Preprocessing complete. Fast ROI extraction enabled for future runs.")
-                    except Exception as e:
-                        print(f"[Rabi] Preprocessing failed: {e}")
-                        
+                    self.rabi_pixel_traces = self.preprocess_rabi_data(self.data, num_averages, num_points)
+                    self.rabi_num_points = num_points
+                    self.rabi_x_range = x_range.copy()
+                    print("[Rabi] Preprocessing complete. Fast ROI extraction enabled for future runs.")
                 except Exception as e:
-                    messagebox.showerror("Analysis Error", f"Rabi analysis failed: {e}")
-                    return
+                    print(f"[Rabi] Preprocessing failed: {e}")
+            except Exception as e:
+                messagebox.showerror("Analysis Error", f"Rabi analysis failed: {e}")
+                return
             
             self.tab_results[tab] = result  # Attach result to tab
             self.populate_rabi_result_tab(tab, result)
@@ -673,29 +1031,29 @@ class NVAnalysisApp:
                     use_preprocessed = False
             if not use_preprocessed:
                 print("[Ramsey] Running full analysis and preprocessing data")
+            try:
+                # Use the Rabi analysis logic for Ramsey
+                result = rabi_analyze_data(
+                    image=image,
+                    data=self.data,
+                    x_range=x_range,
+                    x_min=x_min,
+                    x_max=x_max,
+                    y_min=y_min,
+                    y_max=y_max,
+                    num_averages=num_averages,
+                    num_points=num_points
+                )
                 try:
-                    # Use the Rabi analysis logic for Ramsey
-                    result = rabi_analyze_data(
-                        image=image,
-                        data=self.data,
-                        x_range=x_range,
-                        x_min=x_min,
-                        x_max=x_max,
-                        y_min=y_min,
-                        y_max=y_max,
-                        num_averages=num_averages,
-                        num_points=num_points
-                    )
-                    try:
-                        self.ramsey_pixel_traces = self.preprocess_ramsey_data(self.data, num_averages, num_points)
-                        self.ramsey_num_points = num_points
-                        self.ramsey_x_range = x_range.copy()
-                        print("[Ramsey] Preprocessing complete. Fast ROI extraction enabled for future runs.")
-                    except Exception as e:
-                        print(f"[Ramsey] Preprocessing failed: {e}")
+                    self.ramsey_pixel_traces = self.preprocess_ramsey_data(self.data, num_averages, num_points)
+                    self.ramsey_num_points = num_points
+                    self.ramsey_x_range = x_range.copy()
+                    print("[Ramsey] Preprocessing complete. Fast ROI extraction enabled for future runs.")
                 except Exception as e:
-                    messagebox.showerror("Analysis Error", f"Ramsey analysis failed: {e}")
-                    return
+                    print(f"[Ramsey] Preprocessing failed: {e}")
+            except Exception as e:
+                messagebox.showerror("Analysis Error", f"Ramsey analysis failed: {e}")
+                return
             self.tab_results[tab] = result  # Attach result to tab
             self.populate_ramsey_result_tab(tab, result)
         elif proto == "T1":
@@ -710,12 +1068,20 @@ class NVAnalysisApp:
             except Exception:
                 messagebox.showerror("Input Error", "Invalid ROI values.")
                 return
-            # Use custom x_range if all fields are empty
+            # Use custom x_range if provided in the custom_range_entry
+            custom_range_str = self.custom_range_entry.get().strip()
             default_x_range = np.array([15000, 14000, 13000, 12000, 11000, 10000, 9000, 8000, 7000, 6000, 5000, 4000, 3000, 2000, 1500, 1200, 1000, 800, 500, 300, 100]) * 1e-3
-            start_str = self.param_entries["Start"].get()
-            end_str = self.param_entries["End"].get()
-            step_str = self.param_entries["Steps"].get()
-            if start_str.strip() == "" and end_str.strip() == "" and step_str.strip() == "":
+            start_str = self.param_entries["Start"].get() if self.param_entries and "Start" in self.param_entries else ""
+            end_str = self.param_entries["End"].get() if self.param_entries and "End" in self.param_entries else ""
+            step_str = self.param_entries["Steps"].get() if self.param_entries and "Steps" in self.param_entries else ""
+            x_range = None
+            if custom_range_str:
+                try:
+                    x_range = np.array([float(val) for val in custom_range_str.split(",")]) * 1e-3
+                except Exception:
+                    messagebox.showerror("Input Error", "Invalid custom range values. Please enter comma-separated numbers.")
+                    return
+            elif start_str.strip() == "" and end_str.strip() == "" and step_str.strip() == "":
                 x_range = default_x_range
             else:
                 try:
@@ -740,7 +1106,7 @@ class NVAnalysisApp:
             image = self.data[-1] if self.data.ndim == 3 else self.data
             try:
                 from t1_analy import t1_analyze_data
-                result = t1_analyze_data(
+                result_obj = t1_analyze_data(
                     image=image,
                     data=self.data,
                     x_range=x_range,
@@ -749,12 +1115,15 @@ class NVAnalysisApp:
                     y_min=y_min,
                     y_max=y_max
                 )
+                self.tab_results[tab] = result_obj
+                self.populate_t1_result_tab(tab, result_obj)
             except Exception as e:
                 messagebox.showerror("Analysis Error", f"T1 analysis failed: {e}")
                 return
-            self.tab_results[tab] = result  # Attach result to tab
-            self.populate_t1_result_tab(tab, result)
         else:
+            tab = ttk.Frame(self.results_notebook)
+            self._add_tab_with_close(tab, tab_label)
+            self.results_notebook.select(tab)
             self.populate_result_tab(tab, proto)
 
     def save_results(self):
@@ -792,9 +1161,27 @@ class NVAnalysisApp:
     def load_data(self):
         file_path = filedialog.askopenfilename()
         if file_path:
-            self.loaded_label.config(text="Loading...")
+            self.loaded_label.config(text="Loading:")
+            self._start_spinner()
             self.shape_label.config(text="Shape: -")
             threading.Thread(target=self._load_data_thread, args=(file_path,), daemon=True).start()
+
+    def _start_spinner(self):
+        self._spinner_running = True
+        self._spinner_index = 0
+        self._animate_spinner()
+
+    def _animate_spinner(self):
+        if self._spinner_running:
+            self.spinner_label.config(text=self._spinner_cycle[self._spinner_index])
+            self._spinner_index = (self._spinner_index + 1) % len(self._spinner_cycle)
+            self.root.after(100, self._animate_spinner)
+        else:
+            self.spinner_label.config(text="")
+
+    def _stop_spinner(self):
+        self._spinner_running = False
+        self.spinner_label.config(text="")
 
     def _load_data_thread(self, file_path):
         ext = os.path.splitext(file_path)[-1].lower()
@@ -817,6 +1204,7 @@ class NVAnalysisApp:
         except Exception:
             data = None
         def update_ui():
+            self._stop_spinner()
             if data is None:
                 self.data = None
                 self.loaded_label.config(text=f"Loaded: <filename>")
@@ -826,44 +1214,14 @@ class NVAnalysisApp:
                 self.data = data
                 self.loaded_label.config(text=f"Loaded: {os.path.basename(file_path)}")
                 self.shape_label.config(text=f"Shape: {self.data.shape}")
-                
                 # Clear any existing preprocessed data
-                if hasattr(self, 'preprocessed_cw_data'):
-                    delattr(self, 'preprocessed_cw_data')
-                if hasattr(self, 'cw_num_points'):
-                    delattr(self, 'cw_num_points')
-                if hasattr(self, 'rabi_pixel_traces'):
-                    delattr(self, 'rabi_pixel_traces')
-                if hasattr(self, 'rabi_num_points'):
-                    delattr(self, 'rabi_num_points')
-                if hasattr(self, 'rabi_x_range'):
-                    delattr(self, 'rabi_x_range')
-                
-                # --- Optimized CW preprocessing ---
-                if self.proto_cb.get() == "CW":
-                    try:
-                        # Guess num_points from UI or data shape
-                        try:
-                            start = float(self.param_entries["Start"].get())
-                            end = float(self.param_entries["End"].get())
-                            step = float(self.param_entries["Steps"].get())
-                            x_range = np.arange(start, end + step, step)
-                            num_points = len(x_range)
-                        except Exception:
-                            num_points = 0
-                        if num_points > 0:
-                            usable = self.data[3*num_points:]
-                            num_averages = int(usable.shape[0] // num_points)
-                            if num_averages * num_points == usable.shape[0]:
-                                self.preprocessed_cw_data = preprocess_odmr_data(usable, num_averages, num_points)
-                                self.cw_num_points = num_points
-                            else:
-                                self.preprocessed_cw_data = None
-                        else:
-                            self.preprocessed_cw_data = None
-                    except Exception as e:
-                        print("CW preprocessing failed:", e)
-                        self.preprocessed_cw_data = None
+                for attr in [
+                    'preprocessed_cw_data', 'cw_num_points',
+                    'rabi_pixel_traces', 'rabi_num_points', 'rabi_x_range']:
+                    if hasattr(self, attr):
+                        delattr(self, attr)
+                # --- Remove CW preprocessing from data load ---
+                # (No preprocessing here; only after successful analysis)
         self.root.after(0, update_ui)
 
     def populate_result_tab(self, tab, proto):
@@ -966,30 +1324,49 @@ class NVAnalysisApp:
         summary.pack_propagate(False)
         # --- Fit button logic for CW ---
         def run_cw_fit():
-            from cw_pulsed_fit import process_odmr_fit
-            x = result.x
-            num_peaks = int(self.fit_param_entries["num_peaks"].get())
-            threshold = float(self.fit_param_entries["threshold"].get())
-            show_plot = self.fit_param_entries["show_plot"].get()
-            use_filtered = self.fit_param_entries["use_filtered"].get()
-            y = result.filtered_y if use_filtered else result.y
+            self.run_cw_fit(result, data_frame, summary)
+
+        def _run_cw_fit_thread(self, result, data_frame, summary):
             try:
-                popt, yfit = process_odmr_fit(x, y, num_peaks=num_peaks, threshold=threshold, plot=show_plot)
-            except Exception as e:
-                messagebox.showerror("Fit Error", f"CW fit failed: {e}")
+                from cw_pulsed_fit import process_odmr_fit
+                x = result.x
+                num_peaks = int(self.fit_param_entries["num_peaks"].get())
+                threshold = float(self.fit_param_entries["threshold"].get())
+                show_plot = self.fit_param_entries["show_plot"].get()
+                use_filtered = self.fit_param_entries["use_filtered"].get()
+                y = result.filtered_y if use_filtered else result.y
+                try:
+                    popt, yfit = process_odmr_fit(x, y, num_peaks=num_peaks, threshold=threshold, plot=show_plot)
+                    fit_result = {
+                        "x": x,
+                        "y": y,
+                        "yfit": yfit,
+                        "popt": popt,
+                        "num_peaks": num_peaks,
+                        "threshold": threshold
+                    }
+                    self.root.after(0, lambda: self._handle_cw_fit_result(fit_result, None, data_frame, summary, result))
+                except Exception as e:
+                    self.root.after(0, lambda: self._handle_cw_fit_result(None, str(e), data_frame, summary, result))
+            finally:
+                self.root.after(0, self.finish_fit_animation)
+
+        def _handle_cw_fit_result(self, fit_result, error, data_frame, summary, result):
+            if error:
+                messagebox.showerror("Fit Error", f"CW fit failed: {error}")
                 return
             # Store fit results for this tab
             idx = self.results_notebook.index(self.results_notebook.select())
             tab_widget, _ = self.result_tabs[idx]
             # Build parameter names for multi-peak Lorentzian
             param_names = []
-            for i in range(num_peaks):
+            for i in range(fit_result["num_peaks"]):
                 param_names.extend([f"A{i+1}", f"x0{i+1}", f"gamma{i+1}"])
             self.tab_fit_results[tab_widget] = {
-                "x": x,
-                "y": y,
-                "y_fit": 1 - yfit,
-                "params": popt,
+                "x": fit_result["x"],
+                "y": fit_result["y"],
+                "y_fit": 1 - fit_result["yfit"],
+                "params": fit_result["popt"],
                 "param_names": param_names,
                 "equation": "y = 1 - sum_i A_i * exp(-((x - x0_i)^2) / (2 * gamma_i^2)) (multi-peak Lorentzian)"
             }
@@ -998,10 +1375,10 @@ class NVAnalysisApp:
                 widget.destroy()
             fig_fit = Figure(figsize=(6, 2.6), dpi=100)
             ax_fit = fig_fit.add_subplot(111)
-            ax_fit.plot(x, y, 'ks', label="Raw Data", markersize=5, linestyle='None')
+            ax_fit.plot(fit_result["x"], fit_result["y"], 'ks', label="Raw Data", markersize=5, linestyle='None')
             if hasattr(result, 'filtered_y') and result.filtered_y is not None:
-                ax_fit.plot(x, result.filtered_y, '--', color='gray', label="Filtered", linewidth=1)
-            ax_fit.plot(x, 1 - yfit, 'r-', label="Fit", linewidth=1.5)
+                ax_fit.plot(fit_result["x"], result.filtered_y, '--', color='gray', label="Filtered", linewidth=1)
+            ax_fit.plot(fit_result["x"], 1 - fit_result["yfit"], 'r-', label="Fit", linewidth=1.5)
             ax_fit.set_xlabel("Frequency (GHz)")
             ax_fit.set_ylabel("Normalized Intensity")
             ax_fit.set_title("")
@@ -1013,21 +1390,104 @@ class NVAnalysisApp:
             add_toolbar(canvas_fit, data_frame)
             # Show fit parameters in summary
             fit_text = "Fit parameters:\n"
-            for i in range(0, len(popt), 3):
+            for i in range(0, len(fit_result["popt"]), 3):
                 peak_num = i // 3 + 1
-                amplitude = 1 - popt[i]
-                center = popt[i+1]
-                width = popt[i+2]
+                amplitude = 1 - fit_result["popt"][i]
+                center = fit_result["popt"][i+1]
+                width = fit_result["popt"][i+2]
                 fit_text += f"Peak {peak_num}:\n  amplitude: {amplitude:.4g}\n  center: {center:.4g} MHz\n  width: {width:.4g} MHz\n\n"
             for widget in summary.winfo_children():
                 widget.destroy()
             ttk.Label(summary, text=fit_text, justify="left").pack(anchor="nw")
         # Wire up the fit button
-        self.fit_param_entries["fit_btn"].config(command=run_cw_fit)
+        if self.fit_param_entries and "fit_btn" in self.fit_param_entries:
+            self.fit_param_entries["fit_btn"].config(command=run_cw_fit)
         # Initial summary
         for widget in summary.winfo_children():
             widget.destroy()
         ttk.Label(summary, text="CW analysis complete.", justify="left").pack(anchor="nw")
+
+    def run_cw_fit(self, result, data_frame, summary):
+        self.start_fit_animation()
+        threading.Thread(target=self._run_cw_fit_thread, args=(result, data_frame, summary), daemon=True).start()
+
+    def _run_cw_fit_thread(self, result, data_frame, summary):
+        if self.fit_param_entries is None:
+            self.root.after(0, lambda: messagebox.showerror("Fit Error", "Fit parameter entries are not available."))
+            self.root.after(0, self.finish_fit_animation)
+            return
+        try:
+            from cw_pulsed_fit import process_odmr_fit
+            x = result.x
+            num_peaks = int(self.fit_param_entries["num_peaks"].get())
+            threshold = float(self.fit_param_entries["threshold"].get())
+            show_plot = self.fit_param_entries["show_plot"].get()
+            use_filtered = self.fit_param_entries["use_filtered"].get()
+            y = result.filtered_y if use_filtered else result.y
+            try:
+                popt, yfit = process_odmr_fit(x, y, num_peaks=num_peaks, threshold=threshold, plot=show_plot)
+                fit_result = {
+                    "x": x,
+                    "y": y,
+                    "yfit": yfit,
+                    "popt": popt,
+                    "num_peaks": num_peaks,
+                    "threshold": threshold
+                }
+                self.root.after(0, lambda: self._handle_cw_fit_result(fit_result, None, data_frame, summary, result))
+            except Exception as e:
+                self.root.after(0, lambda: self._handle_cw_fit_result(None, str(e), data_frame, summary, result))
+        finally:
+            self.root.after(0, self.finish_fit_animation)
+
+    def _handle_cw_fit_result(self, fit_result, error, data_frame, summary, result):
+        if error:
+            messagebox.showerror("Fit Error", f"CW fit failed: {error}")
+            return
+        # Store fit results for this tab
+        idx = self.results_notebook.index(self.results_notebook.select())
+        tab_widget, _ = self.result_tabs[idx]
+        # Build parameter names for multi-peak Lorentzian
+        param_names = []
+        for i in range(fit_result["num_peaks"]):
+            param_names.extend([f"A{i+1}", f"x0{i+1}", f"gamma{i+1}"])
+        self.tab_fit_results[tab_widget] = {
+            "x": fit_result["x"],
+            "y": fit_result["y"],
+            "y_fit": 1 - fit_result["yfit"],
+            "params": fit_result["popt"],
+            "param_names": param_names,
+            "equation": "y = 1 - sum_i A_i * exp(-((x - x0_i)^2) / (2 * gamma_i^2)) (multi-peak Lorentzian)"
+        }
+        # Update the Data plot in place (clear previous plot)
+        for widget in data_frame.winfo_children():
+            widget.destroy()
+        fig_fit = Figure(figsize=(6, 2.6), dpi=100)
+        ax_fit = fig_fit.add_subplot(111)
+        ax_fit.plot(fit_result["x"], fit_result["y"], 'ks', label="Raw Data", markersize=5, linestyle='None')
+        if hasattr(result, 'filtered_y') and result.filtered_y is not None:
+            ax_fit.plot(fit_result["x"], result.filtered_y, '--', color='gray', label="Filtered", linewidth=1)
+        ax_fit.plot(fit_result["x"], 1 - fit_result["yfit"], 'r-', label="Fit", linewidth=1.5)
+        ax_fit.set_xlabel("Frequency (GHz)")
+        ax_fit.set_ylabel("Normalized Intensity")
+        ax_fit.set_title("")
+        ax_fit.legend()
+        fig_fit.tight_layout()
+        canvas_fit = FigureCanvasTkAgg(fig_fit, master=data_frame)
+        canvas_fit.draw()
+        canvas_fit.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        add_toolbar(canvas_fit, data_frame)
+        # Show fit parameters in summary
+        fit_text = "Fit parameters:\n"
+        for i in range(0, len(fit_result["popt"]), 3):
+            peak_num = i // 3 + 1
+            amplitude = 1 - fit_result["popt"][i]
+            center = fit_result["popt"][i+1]
+            width = fit_result["popt"][i+2]
+            fit_text += f"Peak {peak_num}:\n  amplitude: {amplitude:.4g}\n  center: {center:.4g} MHz\n  width: {width:.4g} MHz\n\n"
+        for widget in summary.winfo_children():
+            widget.destroy()
+        ttk.Label(summary, text=fit_text, justify="left").pack(anchor="nw")
 
     def populate_rabi_result_tab(self, tab, result):
         # Clear any existing widgets
@@ -1096,13 +1556,11 @@ class NVAnalysisApp:
         ttk.Label(summary, text=summary_text, justify="left").pack(anchor="nw")
         # --- Fit button logic for Rabi ---
         def run_rabi_fit():
-            from scipy.optimize import curve_fit
-            proto = self.proto_cb.get()
-            if proto == "Ramsey":
-                # Should not happen here, but keep for completeness
-                        return
-            else:
-                # Rabi fit as before
+            self.run_rabi_fit(result, data_frame, summary)
+
+        def _run_rabi_fit_thread(self, result, data_frame, summary):
+            try:
+                from scipy.optimize import curve_fit
                 A = float(self.fit_param_entries["Amplitude"].get())
                 omega = float(self.fit_param_entries["Omega"].get())
                 phase = float(self.fit_param_entries["Phase"].get())
@@ -1113,46 +1571,61 @@ class NVAnalysisApp:
                 try:
                     popt, pcov = curve_fit(self.rabi_model, result.x, result.y, p0=p0, maxfev=10000)
                     yfit = self.rabi_model(result.x, *popt)
+                    fit_result = {
+                        "x": result.x,
+                        "y": result.y,
+                        "yfit": yfit,
+                        "popt": popt,
+                        "param_names": ["A", "omega", "phase", "decay", "B", "C"]
+                    }
+                    self.root.after(0, lambda: self._handle_rabi_fit_result(fit_result, None, data_frame, summary, result))
                 except Exception as e:
-                    messagebox.showerror("Fit Error", f"Rabi fit failed: {e}")
-                    return
-                # Store fit results for this tab
-                idx = self.results_notebook.index(self.results_notebook.select())
-                tab_widget, _ = self.result_tabs[idx]
-                param_names = ["A", "omega", "phase", "decay", "B", "C"]
-                self.tab_fit_results[tab_widget] = {
-                    "x": result.x,
-                    "y": result.y,
-                    "y_fit": yfit,
-                    "params": popt,
-                    "param_names": param_names,
-                    "equation": "y = A * cos(omega * x + phase) * exp(-x / decay) + B * x + C (Rabi)"
-                }
-                for widget in data_frame.winfo_children():
-                    widget.destroy()
-                fig_fit = Figure(figsize=(6, 2.6), dpi=100)
-                ax_fit = fig_fit.add_subplot(111)
-                ax_fit.plot(result.x, result.y, 'ks', label="Raw Data", markersize=3, linestyle='None')
-                ax_fit.plot(result.x, yfit, 'r-', linewidth=1.5, label='Fit')
-                ax_fit.set_xlabel('time (ns)')
-                ax_fit.set_ylabel('Intensity')
-                ax_fit.set_title("")
-                ax_fit.legend()
-                fig_fit.tight_layout()
-                canvas_fit = FigureCanvasTkAgg(fig_fit, master=data_frame)
-                canvas_fit.draw()
-                canvas_fit.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-                add_toolbar(canvas_fit, data_frame)
-                # Show fit parameters in summary
-                fit_text = "Fit parameters:\n"
-                param_names = ["A", "omega", "phase", "decay", "B", "C"]
-                for name, val in zip(param_names, popt):
-                    fit_text += f"{name}: {val:.4g}\n"
-                for widget in summary.winfo_children():
-                    widget.destroy()
-                ttk.Label(summary, text=fit_text, justify="left").pack(anchor="nw")
+                    self.root.after(0, lambda: self._handle_rabi_fit_result(None, str(e), data_frame, summary, result))
+            finally:
+                self.root.after(0, self.finish_fit_animation)
+
+        def _handle_rabi_fit_result(self, fit_result, error, data_frame, summary, result):
+            if error:
+                messagebox.showerror("Fit Error", f"Rabi fit failed: {error}")
+                return
+            idx = self.results_notebook.index(self.results_notebook.select())
+            tab_widget, _ = self.result_tabs[idx]
+            self.tab_fit_results[tab_widget] = {
+                "x": fit_result["x"],
+                "y": fit_result["y"],
+                "y_fit": fit_result["yfit"],
+                "params": fit_result["popt"],
+                "param_names": fit_result["param_names"],
+                "equation": "y = A * cos(omega * x + phase) * exp(-x / decay) + B * x + C (Rabi)"
+            }
+            # Update the Data plot in place (clear previous plot)
+            for widget in data_frame.winfo_children():
+                widget.destroy()
+            from matplotlib.figure import Figure
+            fig_fit = Figure(figsize=(6, 2.6), dpi=100)
+            ax_fit = fig_fit.add_subplot(111)
+            ax_fit.plot(fit_result["x"], fit_result["y"], 'ks', label="Raw Data", markersize=3, linestyle='None')
+            ax_fit.plot(fit_result["x"], fit_result["yfit"], 'r-', linewidth=1.5, label='Fit')
+            ax_fit.set_xlabel('time (ns)')
+            ax_fit.set_ylabel('Intensity')
+            ax_fit.set_title("")
+            ax_fit.legend()
+            fig_fit.tight_layout()
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            canvas_fit = FigureCanvasTkAgg(fig_fit, master=data_frame)
+            canvas_fit.draw()
+            canvas_fit.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            add_toolbar(canvas_fit, data_frame)
+            # Show fit parameters in summary
+            fit_text = "Fit parameters:\n"
+            for name, val in zip(fit_result["param_names"], fit_result["popt"]):
+                fit_text += f"{name}: {val:.4g}\n"
+            for widget in summary.winfo_children():
+                widget.destroy()
+            ttk.Label(summary, text=fit_text, justify="left").pack(anchor="nw")
         # Wire up the fit button
-        self.fit_param_entries["fit_btn"].config(command=run_rabi_fit)
+        if self.fit_param_entries and "fit_btn" in self.fit_param_entries:
+            self.fit_param_entries["fit_btn"].config(command=lambda: self.run_rabi_fit(result, data_frame, summary))
 
     def populate_ramsey_result_tab(self, tab, result):
         # Clear any existing widgets
@@ -1267,92 +1740,92 @@ class NVAnalysisApp:
 
         # --- Fit button logic for Ramsey ---
         def run_ramsey_fit():
-            import numpy as np
-            from scipy.optimize import curve_fit
-            from scipy.interpolate import interp1d
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-            # Prepare data
-            model = self.fit_param_entries["model"].get()
-            x_ns = np.array(result.x)
-            y = np.array(result.y)
-            x_s = x_ns * 1e-9
-            uniform_time = np.linspace(x_s.min(), x_s.max(), len(x_s))
-            interp_func = interp1d(x_s, y, kind='cubic')
-            uniform_signal = interp_func(uniform_time)
-            norm_signal = (uniform_signal - np.min(uniform_signal)) / (np.max(uniform_signal) - np.min(uniform_signal))
-            # Fit
-            fit_text = "Fit parameters:\n"
+            self.start_fit_animation()
             try:
-                if model == "Single Cosine":
-                    param_names = ["A", "B", "T", "beta", "f", "phi", "y0"]
-                    p0 = [float(self.fit_param_entries[label].get()) for label in param_names]
-                    popt, pcov = curve_fit(exp_decay_single_cos, uniform_time, norm_signal, p0=p0, maxfev=20000)
-                    yfit = exp_decay_single_cos(uniform_time, *popt)
-                    equation = "y = B*t + A*exp(-t/T-beta*t^2)*cos(2*pi*f*t+phi)+y0 (Single Cosine)"
-                else:
-                    param_names = ["A1", "T1", "f1", "phi1", "A2", "T2", "f2", "phi2", "y0"]
-                    p0 = [float(self.fit_param_entries[label].get()) for label in param_names]
-                    popt, pcov = curve_fit(double_exp_decay_cosine, uniform_time, norm_signal, p0=p0, maxfev=20000)
-                    yfit = double_exp_decay_cosine(uniform_time, *popt)
-                    equation = "y = A1*exp(-(t/T1)^2)*cos(2*pi*f1*t+phi1) + A2*exp(-(t/T2)^2)*cos(2*pi*f2*t+phi2) + y0 (Double Cosine)"
-                for name, val in zip(param_names, popt):
-                    fit_text += f"{name}: {val:.4g}\n"
-                # Store fit results for this tab
-                idx = self.results_notebook.index(self.results_notebook.select())
-                tab_widget, _ = self.result_tabs[idx]
-                self.tab_fit_results[tab_widget] = {
-                    "x": uniform_time,
-                    "y": norm_signal,
-                    "y_fit": yfit,
-                    "params": popt,
-                    "param_names": param_names,
-                    "equation": equation
-                }
-            except Exception as e:
-                from tkinter import messagebox
-                messagebox.showerror("Fit Error", f"Ramsey fit failed: {e}")
-                return
-            # FFT peak calculation
-            dt = uniform_time[1] - uniform_time[0]
-            N = len(uniform_time)
-            freq = np.fft.fftfreq(N, d=dt)
-            fft_vals = np.fft.fft(norm_signal)
-            mask = freq > 0
-            abs_fft = np.abs(fft_vals[mask])
-            freq_mhz = freq[mask] * 1e-6
-            if len(abs_fft) > 0:
-                peak_idx = np.argmax(abs_fft)
-                peak_freq = freq_mhz[peak_idx]
-                peak_amp = abs_fft[peak_idx]
-                fit_text += f"\nFFT peak: {peak_freq:.2f} MHz (ampl: {peak_amp:.2f})\n"
-            # Update the Time Domain plot (clear and redraw)
-            for widget in time_frame.winfo_children():
-                widget.destroy()
-            fig_time = Figure(figsize=(6, 2.6), dpi=100)
-            ax_time = fig_time.add_subplot(111)
-            ax_time.plot(uniform_time*1e9, norm_signal, 'ks', label="Raw Data", markersize=3, linestyle='None')
-            ax_time.plot(uniform_time*1e9, yfit, 'r-', linewidth=1.5, label='Fit')
-            ax_time.set_xlabel('time (ns)')
-            ax_time.set_ylabel('Normalized Intensity')
-            ax_time.set_title("")
-            ax_time.legend()
-            fig_time.tight_layout()
-            canvas_time = FigureCanvasTkAgg(fig_time, master=time_frame)
-            canvas_time.draw()
-            canvas_time.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-            add_toolbar(canvas_time, time_frame)
-            # Update summary with fit parameters and FFT peak
-            for widget in summary.winfo_children():
-                widget.destroy()
-            ttk.Label(summary, text=fit_text, justify="left").pack(anchor="nw")
+                import numpy as np
+                from scipy.optimize import curve_fit
+                from scipy.interpolate import interp1d
+                import matplotlib.pyplot as plt
+                plt.close('all')  # Close any open figures to avoid accumulation
+                # Prepare data
+                model = self.fit_param_entries["model"].get()
+                x_ns = np.array(result.x)
+                y = np.array(result.y)
+                x_s = x_ns * 1e-9
+                uniform_time = np.linspace(x_s.min(), x_s.max(), len(x_s))
+                interp_func = interp1d(x_s, y, kind='cubic')
+                uniform_signal = interp_func(uniform_time)
+                norm_signal = (uniform_signal - np.min(uniform_signal)) / (np.max(uniform_signal) - np.min(uniform_signal))
+                # Fit
+                fit_text = "Fit parameters:\n"
+                try:
+                    if model == "Single Cosine":
+                        param_names = ["A", "B", "T", "beta", "f", "phi", "y0"]
+                        p0 = [float(self.fit_param_entries[label].get()) for label in param_names]
+                        popt, pcov = curve_fit(exp_decay_single_cos, uniform_time, norm_signal, p0=p0, maxfev=20000)
+                        yfit = exp_decay_single_cos(uniform_time, *popt)
+                        equation = "y = B*t + A*exp(-t/T-beta*t^2)*cos(2*pi*f*t+phi)+y0 (Single Cosine)"
+                    else:
+                        param_names = ["A1", "T1", "f1", "phi1", "A2", "T2", "f2", "phi2", "y0"]
+                        p0 = [float(self.fit_param_entries[label].get()) for label in param_names]
+                        popt, pcov = curve_fit(double_exp_decay_cosine, uniform_time, norm_signal, p0=p0, maxfev=20000)
+                        yfit = double_exp_decay_cosine(uniform_time, *popt)
+                        equation = "y = A1*exp(-(t/T1)^2)*cos(2*pi*f1*t+phi1) + A2*exp(-(t/T2)^2)*cos(2*pi*f2*t+phi2) + y0 (Double Cosine)"
+                    for name, val in zip(param_names, popt):
+                        fit_text += f"{name}: {val:.4g}\n"
+                    # Store fit results for this tab
+                    idx = self.results_notebook.index(self.results_notebook.select())
+                    tab_widget, _ = self.result_tabs[idx]
+                    self.tab_fit_results[tab_widget] = {
+                        "x": uniform_time,
+                        "y": norm_signal,
+                        "y_fit": yfit,
+                        "params": popt,
+                        "param_names": param_names,
+                        "equation": equation
+                    }
+                except Exception as e:
+                    from tkinter import messagebox
+                    messagebox.showerror("Fit Error", f"Ramsey fit failed: {e}")
+                    return
+                # FFT peak calculation
+                dt = uniform_time[1] - uniform_time[0]
+                N = len(uniform_time)
+                freq = np.fft.fftfreq(N, d=dt)
+                fft_vals = np.fft.fft(norm_signal)
+                mask = freq > 0
+                abs_fft = np.abs(fft_vals[mask])
+                freq_mhz = freq[mask] * 1e-6
+                if len(abs_fft) > 0:
+                    peak_idx = np.argmax(abs_fft)
+                    peak_freq = freq_mhz[peak_idx]
+                    peak_amp = abs_fft[peak_idx]
+                    fit_text += f"\nFFT peak: {peak_freq:.2f} MHz (ampl: {peak_amp:.2f})\n"
+                # Update the Time Domain plot (clear and redraw)
+                for widget in time_frame.winfo_children():
+                    widget.destroy()
+                fig_time = Figure(figsize=(6, 2.6), dpi=100)
+                ax_time = fig_time.add_subplot(111)
+                ax_time.plot(uniform_time*1e9, norm_signal, 'ks', label="Raw Data", markersize=3, linestyle='None')
+                ax_time.plot(uniform_time*1e9, yfit, 'r-', linewidth=1.5, label='Fit')
+                ax_time.set_xlabel('time (ns)')
+                ax_time.set_ylabel('Normalized Intensity')
+                ax_time.set_title("")
+                ax_time.legend()
+                fig_time.tight_layout()
+                canvas_time = FigureCanvasTkAgg(fig_time, master=time_frame)
+                canvas_time.draw()
+                canvas_time.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+                add_toolbar(canvas_time, time_frame)
+                # Update summary with fit parameters and FFT peak
+                for widget in summary.winfo_children():
+                    widget.destroy()
+                ttk.Label(summary, text=fit_text, justify="left").pack(anchor="nw")
+            finally:
+                self.finish_fit_animation()
         # Wire up the fit button for Ramsey
-        if hasattr(self, 'fit_param_entries') and "fit_btn" in self.fit_param_entries:
-            try:
-                self.fit_param_entries["fit_btn"].config(command=run_ramsey_fit)
-            except Exception:
-                pass
+        if self.fit_param_entries and "fit_btn" in self.fit_param_entries:
+            self.fit_param_entries["fit_btn"].config(command=run_ramsey_fit)
 
     def populate_t1_result_tab(self, tab, result):
         # Clear any existing widgets
@@ -1430,68 +1903,69 @@ class NVAnalysisApp:
 
         # --- Fit button logic for T1 ---
         def run_t1_fit():
-            import numpy as np
-            from scipy.optimize import curve_fit
-            # Stretched exponential: y = a * exp(-((t / T1)^beta)) + c
-            def stretched_exp_decay(x, a, T1, beta, c):
-                return a * np.exp(-((x / T1) ** beta)) + c
-            x = np.array(result.x)
-            y = np.array(result.y)
-            yerr = getattr(result, 'error', None)
-            # Initial guess: [a, T1, beta, c] from GUI fields
+            self.start_fit_animation()
             try:
-                p0 = [float(self.fit_param_entries[name].get()) for name in ["Amplitude", "T1", "Beta", "Offset"]]
-            except Exception:
-                p0 = [0.5, 2.0, 0.8, 0.1]
-            try:
-                if yerr is not None:
-                    popt, pcov = curve_fit(stretched_exp_decay, x, y, p0=p0, sigma=yerr, absolute_sigma=True, maxfev=10000)
-                else:
-                    popt, pcov = curve_fit(stretched_exp_decay, x, y, p0=p0, maxfev=10000)
-                yfit = stretched_exp_decay(x, *popt)
-                # Store fit results for this tab
-                idx = self.results_notebook.index(self.results_notebook.select())
-                tab_widget, _ = self.result_tabs[idx]
-                param_names = ["a", "T1", "beta", "c"]
-                self.tab_fit_results[tab_widget] = {
-                    "x": x,
-                    "y": y,
-                    "y_fit": yfit,
-                    "params": popt,
-                    "param_names": param_names,
-                    "equation": "y = a * exp(-((t / T1)^beta)) + c (Stretched Exponential)"
-                }
-            except Exception as e:
-                from tkinter import messagebox
-                messagebox.showerror("Fit Error", f"T1 fit failed: {e}")
-                return
-            # Update the Time Domain plot (clear and redraw)
-            for widget in time_frame.winfo_children():
-                widget.destroy()
-            fig_time = Figure(figsize=(6, 2.6), dpi=100)
-            ax_time = fig_time.add_subplot(111)
-            ax_time.errorbar(x, y, yerr=yerr, fmt='ks', label="Data", markersize=3, linestyle='None')
-            ax_time.plot(x, yfit, 'r-', linewidth=1.5, label='Fit')
-            ax_time.set_xlabel('time (ms)')
-            ax_time.set_ylabel('Normalized Intensity')
-            ax_time.set_title("")
-            ax_time.legend()
-            fig_time.tight_layout()
-            canvas_time = FigureCanvasTkAgg(fig_time, master=time_frame)
-            canvas_time.draw()
-            canvas_time.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-            add_toolbar(canvas_time, time_frame)
-            # Update summary with fit parameters
-            fit_text = f"Fit parameters:\na: {popt[0]:.4g}\nT1: {popt[1]:.4g} ms\nbeta: {popt[2]:.4g}\nc: {popt[3]:.4g}\n"
-            for widget in summary.winfo_children():
-                widget.destroy()
-            ttk.Label(summary, text=fit_text, justify="left").pack(anchor="nw")
+                import numpy as np
+                from scipy.optimize import curve_fit
+                # Stretched exponential: y = a * exp(-((t / T1)^beta)) + c
+                def stretched_exp_decay(x, a, T1, beta, c):
+                    return a * np.exp(-((x / T1) ** beta)) + c
+                x = np.array(result.x)
+                y = np.array(result.y)
+                yerr = getattr(result, 'error', None)
+                # Initial guess: [a, T1, beta, c] from GUI fields
+                try:
+                    p0 = [float(self.fit_param_entries[name].get()) for name in ["Amplitude", "T1", "Beta", "Offset"]]
+                except Exception:
+                    p0 = [0.5, 2.0, 0.8, 0.1]
+                try:
+                    if yerr is not None:
+                        popt, pcov = curve_fit(stretched_exp_decay, x, y, p0=p0, sigma=yerr, absolute_sigma=True, maxfev=10000)
+                    else:
+                        popt, pcov = curve_fit(stretched_exp_decay, x, y, p0=p0, maxfev=10000)
+                    yfit = stretched_exp_decay(x, *popt)
+                    # Store fit results for this tab
+                    idx = self.results_notebook.index(self.results_notebook.select())
+                    tab_widget, _ = self.result_tabs[idx]
+                    param_names = ["a", "T1", "beta", "c"]
+                    self.tab_fit_results[tab_widget] = {
+                        "x": x,
+                        "y": y,
+                        "y_fit": yfit,
+                        "params": popt,
+                        "param_names": param_names,
+                        "equation": "y = a * exp(-((t / T1)^beta)) + c (Stretched Exponential)"
+                    }
+                except Exception as e:
+                    from tkinter import messagebox
+                    messagebox.showerror("Fit Error", f"T1 fit failed: {e}")
+                    return
+                # Update the Time Domain plot (clear and redraw)
+                for widget in time_frame.winfo_children():
+                    widget.destroy()
+                fig_time = Figure(figsize=(6, 2.6), dpi=100)
+                ax_time = fig_time.add_subplot(111)
+                ax_time.errorbar(x, y, yerr=yerr, fmt='ks', label="Data", markersize=3, linestyle='None')
+                ax_time.plot(x, yfit, 'r-', linewidth=1.5, label='Fit')
+                ax_time.set_xlabel('time (ms)')
+                ax_time.set_ylabel('Normalized Intensity')
+                ax_time.set_title("")
+                ax_time.legend()
+                fig_time.tight_layout()
+                canvas_time = FigureCanvasTkAgg(fig_time, master=time_frame)
+                canvas_time.draw()
+                canvas_time.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+                add_toolbar(canvas_time, time_frame)
+                # Update summary with fit parameters
+                fit_text = f"Fit parameters:\na: {popt[0]:.4g}\nT1: {popt[1]:.4g} ms\nbeta: {popt[2]:.4g}\nc: {popt[3]:.4g}\n"
+                for widget in summary.winfo_children():
+                    widget.destroy()
+                ttk.Label(summary, text=fit_text, justify="left").pack(anchor="nw")
+            finally:
+                self.finish_fit_animation()
         # Wire up the fit button for T1
-        if hasattr(self, 'fit_param_entries') and "fit_btn" in self.fit_param_entries:
-            try:
-                self.fit_param_entries["fit_btn"].config(command=run_t1_fit)
-            except Exception:
-                pass
+        if self.fit_param_entries and "fit_btn" in self.fit_param_entries:
+            self.fit_param_entries["fit_btn"].config(command=run_t1_fit)
 
     def create_sample_plot(self, frame, title, figsize=(4, 2.5)):
         fig = Figure(figsize=figsize, dpi=100)
@@ -1648,6 +2122,103 @@ class NVAnalysisApp:
         roi_traces = self.ramsey_pixel_traces[:, y_min:y_max, x_min:x_max]  # (num_points, roi_y, roi_x)
         ramsey_trace = np.mean(roi_traces, axis=(1, 2))  # (num_points,)
         return ramsey_trace
+
+    def animate_fit_button(self):
+        fitting_text = "Fitting..."
+        display = fitting_text[:self.fit_anim_progress]
+        if self.fit_anim_done:
+            if self.fit_param_entries and "fit_btn" in self.fit_param_entries:
+                self.fit_param_entries["fit_btn"].config(text="Run Fit", state="normal")
+            return
+        if self.fit_param_entries and "fit_btn" in self.fit_param_entries:
+            self.fit_param_entries["fit_btn"].config(text=display)
+        if self.fit_animating and not self.fit_anim_done:
+            self.fit_anim_progress = (self.fit_anim_progress + 1) % (len(fitting_text) + 1)
+            self.root.after(80, self.animate_fit_button)
+
+    def start_fit_animation(self):
+        self.fit_anim_progress = 0
+        self.fit_animating = True
+        self.fit_anim_done = False
+        if self.fit_param_entries and "fit_btn" in self.fit_param_entries:
+            self.fit_param_entries["fit_btn"].config(state="disabled")
+        self.animate_fit_button()
+
+    def finish_fit_animation(self):
+        self.fit_animating = False
+        self.fit_anim_done = True
+        if self.fit_param_entries and "fit_btn" in self.fit_param_entries:
+            self.fit_param_entries["fit_btn"].config(text="Run Fit", state="normal")
+
+    def run_rabi_fit(self, result, data_frame, summary):
+        self.start_fit_animation()
+        threading.Thread(target=self._run_rabi_fit_thread, args=(result, data_frame, summary), daemon=True).start()
+
+    def _run_rabi_fit_thread(self, result, data_frame, summary):
+        try:
+            from scipy.optimize import curve_fit
+            A = float(self.fit_param_entries["Amplitude"].get())
+            omega = float(self.fit_param_entries["Omega"].get())
+            phase = float(self.fit_param_entries["Phase"].get())
+            decay = float(self.fit_param_entries["Decay Rate"].get())
+            B = float(self.fit_param_entries["B"].get())
+            C = float(self.fit_param_entries["C"].get())
+            p0 = [A, omega, phase, decay, B, C]
+            try:
+                popt, pcov = curve_fit(self.rabi_model, result.x, result.y, p0=p0, maxfev=10000)
+                yfit = self.rabi_model(result.x, *popt)
+                fit_result = {
+                    "x": result.x,
+                    "y": result.y,
+                    "yfit": yfit,
+                    "popt": popt,
+                    "param_names": ["A", "omega", "phase", "decay", "B", "C"]
+                }
+                self.root.after(0, lambda: self._handle_rabi_fit_result(fit_result, None, data_frame, summary, result))
+            except Exception as e:
+                self.root.after(0, lambda: self._handle_rabi_fit_result(None, str(e), data_frame, summary, result))
+        finally:
+            self.root.after(0, self.finish_fit_animation)
+
+    def _handle_rabi_fit_result(self, fit_result, error, data_frame, summary, result):
+        if error:
+            messagebox.showerror("Fit Error", f"Rabi fit failed: {error}")
+            return
+        idx = self.results_notebook.index(self.results_notebook.select())
+        tab_widget, _ = self.result_tabs[idx]
+        self.tab_fit_results[tab_widget] = {
+            "x": fit_result["x"],
+            "y": fit_result["y"],
+            "y_fit": fit_result["yfit"],
+            "params": fit_result["popt"],
+            "param_names": fit_result["param_names"],
+            "equation": "y = A * cos(omega * x + phase) * exp(-x / decay) + B * x + C (Rabi)"
+        }
+        # Update the Data plot in place (clear previous plot)
+        for widget in data_frame.winfo_children():
+            widget.destroy()
+        from matplotlib.figure import Figure
+        fig_fit = Figure(figsize=(6, 2.6), dpi=100)
+        ax_fit = fig_fit.add_subplot(111)
+        ax_fit.plot(fit_result["x"], fit_result["y"], 'ks', label="Raw Data", markersize=3, linestyle='None')
+        ax_fit.plot(fit_result["x"], fit_result["yfit"], 'r-', linewidth=1.5, label='Fit')
+        ax_fit.set_xlabel('time (ns)')
+        ax_fit.set_ylabel('Intensity')
+        ax_fit.set_title("")
+        ax_fit.legend()
+        fig_fit.tight_layout()
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        canvas_fit = FigureCanvasTkAgg(fig_fit, master=data_frame)
+        canvas_fit.draw()
+        canvas_fit.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        add_toolbar(canvas_fit, data_frame)
+        # Show fit parameters in summary
+        fit_text = "Fit parameters:\n"
+        for name, val in zip(fit_result["param_names"], fit_result["popt"]):
+            fit_text += f"{name}: {val:.4g}\n"
+        for widget in summary.winfo_children():
+            widget.destroy()
+        ttk.Label(summary, text=fit_text, justify="left").pack(anchor="nw")
 
 # Helper to add the matplotlib navigation toolbar below a plot
 def add_toolbar(canvas, frame):

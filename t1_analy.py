@@ -1,5 +1,7 @@
-import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Use non-GUI backend for thread safety
 import matplotlib.pyplot as plt
+import numpy as np
 import matplotlib.patches as patches
 from typing import Tuple
 from analysis_utils import extract_roi, split_signal_reference, average_over_roi, reshape_and_average, plot_roi_on_image, plot_signal_reference, plot_normalized_signal
@@ -64,7 +66,7 @@ def t1_analyze_data(
     x_range = x_range[::-1]
     final = final[::-1]
     std_final = std_final[::-1]
-    # Create a figure for visualization
+    # Create a figure for visualization (offscreen)
     fig = plt.figure(figsize=FIG_SIZE)
     # Plot the reference image and highlight the ROI
     image_plot = plt.subplot2grid((3, 3), (0, 0), rowspan=2, colspan=1)
@@ -76,7 +78,7 @@ def t1_analyze_data(
     plot2 = plt.subplot2grid((3, 3), (1, 1), colspan=3, rowspan=2)
     plot_normalized_signal(x_range, final, yerr=std_final, xlabel='Relaxation time (ms)', ylabel='Intensity', title='T1 measurements', ax=plot2)
     plt.tight_layout()
-    # plt.show()  # Disabled for GUI integration
+    plt.close(fig)  # Close the figure to free memory and avoid GUI issues
     # Return x values, normalized signal, and propagated error as T1Result, plus mean_signal and mean_reference for GUI
     result = T1Result(x=x_range, y=final, error=std_final)
     result.mean_signal = mean_signal

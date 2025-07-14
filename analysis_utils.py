@@ -134,4 +134,4 @@ def extract_roi_trace(preprocessed_data: np.ndarray, x_min: int, x_max: int, y_m
     roi = preprocessed_data[:, y_min:y_max, x_min:x_max]
     odmr_trace = roi.mean(axis=(1,2))
     odmr_trace = odmr_trace / np.max(odmr_trace)
-    return odmr_trace 
+    return odmr_trace
