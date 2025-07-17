@@ -54,13 +54,13 @@ def odmr_analyze_data(
     # Loop through each frame and average the ROI
     for i in range(len(data_f)):
         ROI = extract_roi(np.expand_dims(data_f[i], axis=0), trace_x1, trace_x2, trace_y1, trace_y2)[0]
-        print(ROI)
+        #print(ROI)
         ROI_avg_x[0, i] = np.mean(ROI)
-    print(ROI_avg_x)
-    print(np.size(ROI_avg_x))
+    #print(ROI_avg_x)
+    #print(np.size(ROI_avg_x))
     # Reshape to (num_averages, num_points) for further averaging
     odmr = np.reshape(ROI_avg_x, (num_averages, num_points))
-    print(np.size(odmr))
+    #print(np.size(odmr))
     # Average across all averages to get the final trace
     odmr_trace = np.mean(odmr, axis=0)
     # Normalize the trace
