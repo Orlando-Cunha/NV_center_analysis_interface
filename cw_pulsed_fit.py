@@ -61,7 +61,7 @@ def baseline_correction_arpls(y_data: np.ndarray, x_data: np.ndarray) -> Tuple[n
     return corrected_y, baseline
 
 # Peak Detection
-def find_peaks(num_peaks: int, threshold: float, y_data: np.ndarray, x_data: np.ndarray, plot: bool = False) -> pd.Index:
+def find_peaks(num_peaks: int, threshold: float, y_data: np.ndarray, x_data: np.ndarray, plot: bool = False, lookahead: int = 4, show_peaks: bool = False, return_indices: bool = False) -> pd.Index:
     """
     Find valleys corresponding to peaks in the ODMR spectrum.
     Parameters:
@@ -69,16 +69,21 @@ def find_peaks(num_peaks: int, threshold: float, y_data: np.ndarray, x_data: np.
         threshold (float): Initial threshold for peak finding
         y_data (np.ndarray): Data to search for peaks
         x_data (np.ndarray): x-axis values
-        plot (bool): Whether to plot the detected peaks
+        plot (bool): Whether to plot the detected peaks (not used, kept for compatibility)
+        lookahead (int): Lookahead parameter for valley detection
+        show_peaks (bool): If True, plot the detected valleys
+        return_indices (bool): If True, return the indices of the detected valleys
     Returns:
         pd.Index: Indices of detected valleys
     """
     valley_indices = pd.Index([], dtype='int64')
     # Incrementally increase threshold until enough valleys are found
     while len(valley_indices) < num_peaks and threshold < 1:
-        valley_indices = find_valleys(x_data, y_data, threshold, False)
+        valley_indices = find_valleys(x_data, y_data, threshold, plot=show_peaks, lookahead=lookahead)
         threshold += 0.0005
-    valley_indices = find_valleys(x_data, y_data, threshold, False)
+    valley_indices = find_valleys(x_data, y_data, threshold, plot=show_peaks, lookahead=lookahead)
+    if return_indices:
+        return valley_indices
     return valley_indices
 
 # Generate Lorentzian Function
@@ -153,8 +158,11 @@ def process_odmr_fit(
     y_data: np.ndarray,
     num_peaks: int = 4,
     threshold: float = 0.974,
-    plot: bool = True
-) -> Tuple[np.ndarray, np.ndarray]:
+    lookahead: int = 4,
+    plot: bool = True,
+    show_peaks: bool = False,
+    return_peaks: bool = False
+) -> Tuple:
     """
     Full pipeline for ODMR data fitting.
     Parameters:
@@ -162,16 +170,23 @@ def process_odmr_fit(
         y_data (np.ndarray): 1D array of intensities.
         num_peaks (int): Number of Lorentzian peaks to fit.
         threshold (float): Initial threshold for peak finding.
+        lookahead (int): Lookahead parameter for valley detection.
         plot (bool): Whether to plot the fit and data.
+        show_peaks (bool): Whether to plot the detected valleys during peak finding.
+        return_peaks (bool): Whether to return the x/y values of detected peaks for GUI overlay.
     Returns:
-        tuple: (popt, yfit) - fit parameters and fitted curve values.
+        tuple: (popt, yfit) or (popt, yfit, peak_x, peak_y) if return_peaks is True.
     """
     # Smooth the data
     smoothed_y = smooth_function(y_data)
     # Find peaks
-    valley_indices = find_peaks(num_peaks, threshold, smoothed_y, x_data, plot=False)
+    valley_indices = find_peaks(num_peaks, threshold, smoothed_y, x_data, plot=False, lookahead=lookahead, show_peaks=show_peaks, return_indices=True)
     # Correct baseline
     corrected_y, baseline_offset = baseline_correction_arpls(smoothed_y, x_data)
     # Fit data
     popt, pcov, yfit = fit_odmr_data(x_data, y_data, corrected_y, valley_indices, baseline_offset, plot=plot)
+    if return_peaks:
+        peak_x = x_data[valley_indices]
+        peak_y = y_data[valley_indices]
+        return popt, yfit, peak_x, peak_y
     return popt, yfit

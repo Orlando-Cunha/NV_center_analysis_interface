@@ -38,7 +38,8 @@ def find_valleys(
     x_data: np.ndarray,
     y_data: np.ndarray,
     threshold: float = DEFAULT_THRESHOLD,
-    plot: bool = True
+    plot: bool = True,
+    lookahead: int = 4
 ) -> pd.Index:
     """
     Find valleys (local minima) in the provided y_data using the findpeaks library.
@@ -48,13 +49,14 @@ def find_valleys(
         y_data (np.ndarray): The y-axis data (e.g., intensity).
         threshold (float): Only valleys with y-values below this threshold are considered.
         plot (bool): If True, plot the data and highlight the detected valleys.
+        lookahead (int): Lookahead parameter for the findpeaks algorithm.
 
     Returns:
         filtered_indices (pd.Index): Indices of the detected valleys below the threshold.
     """
     # Suppress any output from findpeaks
     with contextlib.redirect_stdout(io.StringIO()):
-        fp = findpeaks(method="peakdetect", whitelist=['valley'], lookahead=12, scale=True, togray=True, denoise=True)
+        fp = findpeaks(method="peakdetect", whitelist=['valley'], lookahead=lookahead, scale=True, togray=True, denoise=True)
         results: dict[str, Any] = fp.fit(y_data)
 
     # Extract the DataFrame with peak/valley information
@@ -66,7 +68,7 @@ def find_valleys(
     filtered_df = df[(df['valley'] == True) & (df['y'] < threshold)]
     filtered_indices = filtered_df.index
     x_filtered = x_data[filtered_indices]
-
+    '''
     if plot:
         # Plot the original data and highlight the detected valleys
         plt.figure()
@@ -74,5 +76,5 @@ def find_valleys(
         plt.scatter(x_filtered, filtered_df['y'], color='red', label='Filtered Valleys')
         plt.legend()
         plt.show()
-
+    '''
     return filtered_indices
